@@ -1,0 +1,483 @@
+import os
+import logging
+import time
+import threading
+from datetime import datetime
+from flask import Flask, request
+import telebot
+from pybit.unified_trading import HTTP
+
+# ========== НАСТРОЙКА ==========
+
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Токены и ключи из переменных окружения
+TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
+BYBIT_API_KEY = os.environ.get('BYBIT_API_KEY')
+BYBIT_API_SECRET = os.environ.get('BYBIT_API_SECRET')
+
+# Параметры торговли
+SYMBOL = "BTCUSDT"
+AMOUNT = 10  # 10 USDT
+TARGET_PROFIT_PERCENT = 0.5  # +0.5%
+MARKET_UNIT = "quoteCoin"
+
+# Параметры автоторговли
+AUTO_TRADE_ENABLED = True
+CHECK_INTERVAL = 300  # 5 минут
+RSI_OVERSOLD = 30  # RSI для покупки
+
+# Инициализация
+bot = telebot.TeleBot(TELEGRAM_TOKEN)
+app = Flask(__name__)
+
+# Подключение к Bybit
+session = HTTP(
+    testnet=False,
+    api_key=BYBIT_API_KEY,
+    api_secret=BYBIT_API_SECRET
+)
+
+# Хранилище активных сделок
+active_trades = {}
+
+# ID чата для уведомлений (можно заменить на твой)
+ADMIN_CHAT_ID = os.environ.get('ADMIN_CHAT_ID')
+
+# ========== ФУНКЦИИ BYBIT ==========
+
+def get_balance():
+    """Получение баланса USDT"""
+    try:
+        response = session.get_wallet_balance(
+            accountType="UNIFIED",
+            coin="USDT"
+        )
+        if response['retCode'] == 0:
+            balance = response['result']['list'][0]['coin'][0]['walletBalance']
+            return float(balance)
+        logger.error(f"Ошибка баланса: {response}")
+        return 0
+    except Exception as e:
+        logger.error(f"Исключение баланса: {e}")
+        return 0
+
+def get_current_price():
+    """Получение текущей цены"""
+    try:
+        response = session.get_tickers(category="spot", symbol=SYMBOL)
+        if response['retCode'] == 0:
+            return float(response['result']['list'][0]['lastPrice'])
+        logger.error(f"Ошибка цены: {response}")
+        return 0
+    except Exception as e:
+        logger.error(f"Исключение цены: {e}")
+        return 0
+
+def get_historical_prices(limit=50):
+    """Получение исторических цен для RSI"""
+    try:
+        response = session.get_kline(
+            category="spot",
+            symbol=SYMBOL,
+            interval="15",
+            limit=limit
+        )
+        if response['retCode'] == 0:
+            # Цены закрытия
+            return [float(item[4]) for item in response['result']['list']]
+        return []
+    except Exception as e:
+        logger.error(f"Ошибка истории: {e}")
+        return []
+
+def calculate_rsi(prices, period=14):
+    """Расчет RSI"""
+    if len(prices) < period + 1:
+        return 50
+    
+    gains = []
+    losses = []
+    
+    for i in range(1, len(prices)):
+        diff = prices[i] - prices[i-1]
+        if diff >= 0:
+            gains.append(diff)
+            losses.append(0)
+        else:
+            gains.append(0)
+            losses.append(abs(diff))
+    
+    avg_gain = sum(gains[-period:]) / period
+    avg_loss = sum(losses[-period:]) / period
+    
+    if avg_loss == 0:
+        return 100
+    
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+def place_buy_order():
+    """Размещение ордера на покупку"""
+    try:
+        params = {
+            "category": "spot",
+            "symbol": SYMBOL,
+            "side": "Buy",
+            "orderType": "Market",
+            "qty": str(AMOUNT),
+            "marketUnit": MARKET_UNIT
+        }
+        
+        logger.info(f"Покупка: {params}")
+        response = session.place_order(**params)
+        
+        if response['retCode'] == 0:
+            return {
+                "success": True,
+                "order_id": response['result']['orderId']
+            }
+        else:
+            return {
+                "success": False,
+                "error": response['retMsg']
+            }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+def place_sell_order(qty):
+    """Размещение ордера на продажу"""
+    try:
+        params = {
+            "category": "spot",
+            "symbol": SYMBOL,
+            "side": "Sell",
+            "orderType": "Market",
+            "qty": str(qty),
+            "marketUnit": "baseCoin"
+        }
+        
+        logger.info(f"Продажа: {params}")
+        response = session.place_order(**params)
+        
+        if response['retCode'] == 0:
+            return {
+                "success": True,
+                "order_id": response['result']['orderId']
+            }
+        else:
+            return {
+                "success": False,
+                "error": response['retMsg']
+            }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+# ========== АВТОМАТИЧЕСКАЯ ТОРГОВЛЯ ==========
+
+def auto_trader():
+    """Автоматический трейдер на основе RSI"""
+    global AUTO_TRADE_ENABLED
+    
+    logger.info("🚀 Автотрейдер запущен")
+    
+    while AUTO_TRADE_ENABLED:
+        try:
+            # Проверяем активные сделки
+            if len(active_trades) > 0:
+                time.sleep(CHECK_INTERVAL)
+                continue
+            
+            # Проверяем баланс
+            balance = get_balance()
+            if balance < AMOUNT:
+                logger.warning(f"Недостаточно средств: {balance:.2f} USDT")
+                time.sleep(CHECK_INTERVAL * 6)
+                continue
+            
+            # Получаем цены и RSI
+            prices = get_historical_prices()
+            if len(prices) < 20:
+                time.sleep(60)
+                continue
+            
+            rsi = calculate_rsi(prices)
+            current_price = prices[-1]
+            
+            logger.info(f"RSI: {rsi:.2f}, Цена: ${current_price:.2f}")
+            
+            # Сигнал на покупку
+            if rsi < RSI_OVERSOLD:
+                logger.info(f"🔥 СИГНАЛ! RSI {rsi:.2f} < {RSI_OVERSOLD}")
+                
+                # Уведомление в Telegram
+                if ADMIN_CHAT_ID:
+                    bot.send_message(
+                        ADMIN_CHAT_ID,
+                        f"📊 Сигнал на покупку!\nRSI: {rsi:.2f}\nПокупаю BTC..."
+                    )
+                
+                # Покупаем
+                result = place_buy_order()
+                
+                if result["success"]:
+                    price = get_current_price()
+                    btc_amount = AMOUNT / price
+                    target_price = price * (1 + TARGET_PROFIT_PERCENT / 100)
+                    
+                    # Сохраняем сделку
+                    chat_id = ADMIN_CHAT_ID or 0
+                    active_trades[chat_id] = {
+                        "buy_price": price,
+                        "btc_amount": btc_amount,
+                        "target_price": target_price,
+                        "order_id": result["order_id"],
+                        "rsi": rsi
+                    }
+                    
+                    logger.info(f"✅ Куплено {btc_amount:.6f} BTC по ${price:.2f}")
+                    
+                    # Уведомление
+                    if ADMIN_CHAT_ID:
+                        bot.send_message(
+                            ADMIN_CHAT_ID,
+                            f"✅ АВТОПОКУПКА!\n\n"
+                            f"Куплено: {btc_amount:.6f} BTC\n"
+                            f"Цена: ${price:,.2f}\n"
+                            f"RSI: {rsi:.2f}\n"
+                            f"Цель: ${target_price:,.2f}"
+                        )
+                    
+                    # Запускаем мониторинг
+                    monitor_price(chat_id, btc_amount, target_price)
+                    
+                else:
+                    logger.error(f"Ошибка покупки: {result['error']}")
+                    if ADMIN_CHAT_ID:
+                        bot.send_message(
+                            ADMIN_CHAT_ID,
+                            f"❌ Ошибка покупки: {result['error']}"
+                        )
+            
+            # Ждем
+            time.sleep(CHECK_INTERVAL)
+            
+        except Exception as e:
+            logger.error(f"Ошибка автотрейдера: {e}")
+            time.sleep(60)
+
+def monitor_price(chat_id, btc_amount, target_price):
+    """Мониторинг цены и продажа при достижении цели"""
+    
+    def check():
+        while chat_id in active_trades:
+            try:
+                current_price = get_current_price()
+                
+                if current_price >= target_price:
+                    logger.info(f"Цель достигнута! {current_price} >= {target_price}")
+                    
+                    # Продаем
+                    result = place_sell_order(btc_amount)
+                    
+                    if result["success"]:
+                        buy_price = active_trades[chat_id]["buy_price"]
+                        profit = (current_price - buy_price) * btc_amount
+                        
+                        # Уведомление
+                        if chat_id != 0:
+                            bot.send_message(
+                                chat_id,
+                                f"🎯 ЦЕЛЬ ДОСТИГНУТА!\n\n"
+                                f"Продано: {btc_amount:.6f} BTC\n"
+                                f"Цена: ${current_price:,.2f}\n"
+                                f"Прибыль: ${profit:.2f} USDT"
+                            )
+                        
+                        logger.info(f"✅ Продано, прибыль ${profit:.2f}")
+                        del active_trades[chat_id]
+                        
+                    else:
+                        logger.error(f"Ошибка продажи: {result['error']}")
+                        if chat_id != 0:
+                            bot.send_message(
+                                chat_id,
+                                f"⚠️ Ошибка продажи: {result['error']}"
+                            )
+                    
+                    break
+                
+                time.sleep(10)  # Проверка каждые 10 секунд
+                
+            except Exception as e:
+                logger.error(f"Ошибка мониторинга: {e}")
+                time.sleep(30)
+    
+    thread = threading.Thread(target=check)
+    thread.daemon = True
+    thread.start()
+
+# ========== КОМАНДЫ ТЕЛЕГРАМ ==========
+
+@bot.message_handler(commands=['start'])
+def start_command(message):
+    """Приветствие"""
+    text = (
+        "🤖 Бот для АВТОМАТИЧЕСКОЙ торговли на Bybit\n\n"
+        "Режим: ПОЛНЫЙ АВТОМАТ (проверка RSI каждые 5 минут)\n\n"
+        "Команды:\n"
+        "/buy - Ручная покупка\n"
+        "/status - Статус сделки\n"
+        "/balance - Баланс\n"
+        "/price - Цена BTC\n"
+        "/rsi - Текущий RSI\n"
+        "/autoon - Вкл авто\n"
+        "/autooff - Выкл авто"
+    )
+    bot.reply_to(message, text)
+
+@bot.message_handler(commands=['price'])
+def price_command(message):
+    """Текущая цена"""
+    price = get_current_price()
+    if price:
+        bot.reply_to(message, f"📊 BTC: ${price:,.2f}")
+    else:
+        bot.reply_to(message, "❌ Ошибка")
+
+@bot.message_handler(commands=['balance'])
+def balance_command(message):
+    """Баланс"""
+    balance = get_balance()
+    price = get_current_price()
+    if price:
+        btc = balance / price
+        bot.reply_to(message, f"💰 USDT: {balance:.2f}\nBTC: {btc:.6f}")
+    else:
+        bot.reply_to(message, f"💰 USDT: {balance:.2f}")
+
+@bot.message_handler(commands=['rsi'])
+def rsi_command(message):
+    """Текущий RSI"""
+    prices = get_historical_prices()
+    if len(prices) > 14:
+        rsi = calculate_rsi(prices)
+        status = "📉 Перепроданность" if rsi < 30 else "📈 Перекупленность" if rsi > 70 else "➡️ Нейтрально"
+        bot.reply_to(message, f"📊 RSI: {rsi:.2f}\n{status}")
+    else:
+        bot.reply_to(message, "❌ Нет данных")
+
+@bot.message_handler(commands=['status'])
+def status_command(message):
+    """Статус сделки"""
+    chat_id = message.chat.id
+    
+    if chat_id in active_trades:
+        t = active_trades[chat_id]
+        price = get_current_price()
+        profit = ((price - t['buy_price']) / t['buy_price']) * 100
+        
+        bot.reply_to(message,
+            f"📈 АКТИВНАЯ СДЕЛКА\n\n"
+            f"Куплено: {t['btc_amount']:.6f} BTC\n"
+            f"Цена: ${t['buy_price']:,.2f}\n"
+            f"Сейчас: ${price:,.2f}\n"
+            f"Прибыль: {profit:+.2f}%\n"
+            f"Цель: ${t['target_price']:,.2f}")
+    else:
+        bot.reply_to(message, "📭 Нет активных сделок")
+
+@bot.message_handler(commands=['buy'])
+def buy_command(message):
+    """Ручная покупка"""
+    chat_id = message.chat.id
+    
+    if chat_id in active_trades:
+        bot.reply_to(message, "⚠️ Уже есть сделка")
+        return
+    
+    balance = get_balance()
+    if balance < AMOUNT:
+        bot.reply_to(message, f"❌ Недостаточно: {balance:.2f} USDT")
+        return
+    
+    bot.reply_to(message, "🔄 Покупаю...")
+    
+    result = place_buy_order()
+    
+    if result["success"]:
+        price = get_current_price()
+        btc = AMOUNT / price
+        target = price * 1.005
+        
+        active_trades[chat_id] = {
+            "buy_price": price,
+            "btc_amount": btc,
+            "target_price": target,
+            "order_id": result["order_id"]
+        }
+        
+        bot.reply_to(message,
+            f"✅ Куплено!\n"
+            f"{btc:.6f} BTC по ${price:,.2f}\n"
+            f"Цель: ${target:,.2f}")
+        
+        monitor_price(chat_id, btc, target)
+    else:
+        bot.reply_to(message, f"❌ Ошибка: {result['error']}")
+
+@bot.message_handler(commands=['autoon'])
+def autoon_command(message):
+    """Включить авто"""
+    global AUTO_TRADE_ENABLED
+    AUTO_TRADE_ENABLED = True
+    bot.reply_to(message, "✅ Автоторговля ВКЛ")
+
+@bot.message_handler(commands=['autooff'])
+def autooff_command(message):
+    """Выключить авто"""
+    global AUTO_TRADE_ENABLED
+    AUTO_TRADE_ENABLED = False
+    bot.reply_to(message, "⏸️ Автоторговля ВЫКЛ")
+
+# ========== ВЕБХУК ==========
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    """Прием обновлений от Telegram"""
+    update = request.get_data(as_text=True)
+    try:
+        bot.process_new_updates([telebot.types.Update.de_json(update)])
+    except Exception as e:
+        logger.error(f"Ошибка вебхука: {e}")
+    return 'OK', 200
+
+@app.route('/')
+def index():
+    """Проверка работы"""
+    return "🤖 Bybit Auto Trading Bot is running!"
+
+# ========== ЗАПУСК ==========
+
+if __name__ == '__main__':
+    # Запускаем автотрейдер в отдельном потоке
+    if AUTO_TRADE_ENABLED:
+        trader_thread = threading.Thread(target=auto_trader)
+        trader_thread.daemon = True
+        trader_thread.start()
+    
+    # Запускаем Flask
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
